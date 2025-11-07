@@ -47,8 +47,12 @@ async function agendar(token, dados) {
 
 app.post("/webhook", async (req, res) => {
   const header = req.headers.authorization || "";
+  console.log("🔍 Recebido no cabeçalho:", header);
+  console.log("🔑 WEBHOOK_SECRET esperado:", `Bearer ${WEBHOOK_SECRET}`);
+
   if (header !== `Bearer ${WEBHOOK_SECRET}`)
     return res.status(401).json({ erro: "Acesso não autorizado" });
+
 
   const { nome, cpf, data, hora, profissionalId, servicoId, especialidadeId, accountUnidade } =
     req.body;
@@ -96,3 +100,4 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`✅ Webhook rodando na porta ${PORT}`));
+
