@@ -4,100 +4,147 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-const REFRESH_TOKEN = process.env.REFRESH_TOKEN;
-const ACCOUNT = process.env.ACCOUNT;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "MEU_TOKEN_SECRETO";
-const NINSAUDE_API = "https://api.ninsaude.com/v1";
-const PORT = process.env.PORT || 3000;
+// CONFIG FIXA - AJUSTE PARA SUA REALIDADE
+const NINSAUDE_REFRESH_TOKEN = process.env.NINSAUDE_REFRESH_TOKEN;
+const ACCOUNT_UNIDADE = 1;     // unidade fixa
+const PROFISSIONAL_ID = 3;     // profissional fixo
+const SERVICO_ID = 1;          // ex: 1ª Consulta
+const ESPECIALIDADE_ID = 1;    // especialidade fixa
 
+// 1) Gera access_token via refresh_token
 async function getAccessToken() {
-  const params = new URLSearchParams();
-  params.append("grant_type", "refresh_token");
-  params.append("refresh_token", REFRESH_TOKEN);
-  params.append("account", ACCOUNT);
-  const res = await axios.post(`${NINSAUDE_API}/oauth2/token`, params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
+  const data = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: NINSAUDE_REFRESH_TOKEN
+  }).toString();
+
+  const res = await axios.post(
+    "https://api.ninsaude.com/v1/oauth2/token",
+    data,
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+
   return res.data.access_token;
 }
 
-async function buscarPaciente(token, cpf) {
-  const res = await axios.get(
-    `${NINSAUDE_API}/cadastro_paciente/listar?filter=${cpf}&property=id`,
-    { headers: { Authorization: `bearer ${token}` } }
+// 2) Busca ou cria paciente usando telefone como identificador
+async function getOrCreatePaciente(accessToken, nome, telefone) {
+  const cleanPhone = (telefone || "").replace(/\D/g, "");
+
+  // tenta localizar por telefone ou nome
+  const listRes = await axios.get(
+    `https://api.ninsaude.com/v1/cadastro_paciente/listar?filter=${cleanPhone || nome}&property=id,nome,telefone1`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
   );
-  return res.data[0]?.id || null;
+
+  if (listRes.data.result && listRes.data.result.length > 0) {
+    return listRes.data.result[0].id;
+  }
+
+  // se não encontrar, cria sem CPF
+  const createRes = await axios.post(
+    "https://api.ninsaude.com/v1/cadastro_paciente",
+    {
+      nome,
+      telefone1: cleanPhone || null,
+      ativo: 1
+    },
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
+  return createRes.data.result.id;
 }
 
-async function cadastrarPaciente(token, nome, cpf) {
-  const res = await axios.post(
-    `${NINSAUDE_API}/cadastro_paciente`,
-    { nome, cpf, ativo: 1 },
-    { headers: { Authorization: `bearer ${token}` } }
-  );
-  return res.data.id || res.data;
-}
+// 3) Verifica se horário está disponível para o profissional fixo
+async function isHorarioDisponivel(accessToken, data, hora) {
+  const url =
+    `https://api.ninsaude.com/v1/atendimento_agenda/listar/horario/disponivel/profissional/${PROFISSIONAL_ID}` +
+    `/dataInicial/${data}/dataFinal/${data}?accountUnidade=${ACCOUNT_UNIDADE}`;
 
-async function agendar(token, dados) {
-  const res = await axios.post(`${NINSAUDE_API}/atendimento_agenda`, dados, {
-    headers: { Authorization: `bearer ${token}` },
+  const res = await axios.get(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
   });
+
+  if (!res.data.result) return false;
+
+  return res.data.result.some(h => h.horaInicial.startsWith(hora));
+}
+
+// 4) Cria agendamento
+async function criarAgendamento(accessToken, { pacienteId, data, hora }) {
+  const [h, m] = hora.split(":").map(Number);
+  const end = new Date();
+  end.setHours(h);
+  end.setMinutes(m + 30);
+  const horaFinal = end.toTimeString().slice(0, 8);
+
+  const payload = {
+    accountUnidade: ACCOUNT_UNIDADE,
+    profissional: PROFISSIONAL_ID,
+    data,
+    horaInicial: `${hora}:00`,
+    horaFinal,
+    paciente: pacienteId,
+    status: 0,
+    servico: SERVICO_ID,
+    especialidade: ESPECIALIDADE_ID
+  };
+
+  const res = await axios.post(
+    "https://api.ninsaude.com/v1/atendimento_agenda",
+    payload,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
   return res.data;
 }
 
-app.post("/webhook", async (req, res) => {
-  const header = req.headers.authorization || "";
-  console.log("🔍 Recebido no cabeçalho:", header);
-  console.log("🔑 WEBHOOK_SECRET esperado:", `Bearer ${WEBHOOK_SECRET}`);
-
-  if (header !== `Bearer ${WEBHOOK_SECRET}`)
-    return res.status(401).json({ erro: "Acesso não autorizado" });
-
-
-  const { nome, cpf, data, hora, profissionalId, servicoId, especialidadeId, accountUnidade } =
-    req.body;
-
-  if (!nome || !cpf || !data || !hora || !profissionalId || !accountUnidade)
-    return res.status(400).json({ erro: "Campos obrigatórios faltando" });
-
+// 5) Endpoint para o NicoChat chamar
+app.post("/agendar", async (req, res) => {
   try {
-    const token = await getAccessToken();
+    const { nome, telefone, data, hora } = req.body;
 
-    let paciente = await buscarPaciente(token, cpf);
-    if (!paciente) paciente = await cadastrarPaciente(token, nome, cpf);
-
-    function addMinutos(horaStr, minutos = 30) {
-      const [h, m] = horaStr.split(":").map(Number);
-      const d = new Date(0, 0, 0, h, m);
-      d.setMinutes(d.getMinutes() + minutos);
-      return d.toTimeString().split(" ")[0];
+    if (!nome || !data || !hora) {
+      return res.status(400).json({
+        ok: false,
+        message: "Dados incompletos. Informe nome, data e horário."
+      });
     }
 
-    const horaInicial = hora.length === 5 ? `${hora}:00` : hora;
-    const horaFinal = addMinutos(hora);
+    const accessToken = await getAccessToken();
+    const pacienteId = await getOrCreatePaciente(accessToken, nome, telefone);
 
-    const agendamento = {
-      accountUnidade,
-      profissional: profissionalId,
+    const disponivel = await isHorarioDisponivel(accessToken, data, hora);
+
+    if (!disponivel) {
+      return res.status(200).json({
+        ok: false,
+        message: "Esse horário não está disponível. Por favor, escolha outro."
+      });
+    }
+
+    const agendamento = await criarAgendamento(accessToken, {
+      pacienteId,
       data,
-      horaInicial,
-      horaFinal,
-      paciente,
-      status: 0,
-      servico: servicoId || null,
-      especialidade: especialidadeId || null,
-    };
+      hora
+    });
 
-    const criado = await agendar(token, agendamento);
-    return res.json({ sucesso: true, agendamento: criado });
+    return res.status(200).json({
+      ok: true,
+      message: "Consulta agendada com sucesso.",
+      agendamento
+    });
   } catch (err) {
     console.error(err.response?.data || err.message);
     return res.status(500).json({
-      erro: "Falha ao criar agendamento",
-      detalhes: err.response?.data || err.message,
+      ok: false,
+      message: "Erro ao tentar agendar.",
+      detalhe: err.response?.data || err.message
     });
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Webhook rodando na porta ${PORT}`));
-
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log("Integração rodando na porta " + PORT);
+});
